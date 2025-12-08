@@ -1,6 +1,7 @@
 package database
 
 import (
+	"card-collectors-uk/analysis"
 	"context"
 	"fmt"
 )
@@ -71,4 +72,29 @@ func GetAPICredentialsByMarketplaceName(ctx context.Context, marketplaceName str
 	}
 
 	return credentials, nil
+}
+
+func InsertListingWithCanonicalCard(ctx context.Context, canonicalCardKey string, listing analysis.Listing) (int, error) {
+	var listingID int
+
+	query := `SELECT insert_listing_with_canonical($1,$2,$3,$4,$5,$6,$7,$8,$9,$10);`
+
+	err := ConnectionPool.QueryRow(
+		ctx,
+		query,
+		canonicalCardKey,
+		listing.MarketplaceListingID,
+		listing.Marketplace,
+		listing.Title,
+		listing.Description,
+		listing.URL,
+		listing.Price,
+		listing.CurrencyCode,
+		listing.ShippingCost,
+		listing.ListingDate).Scan(&listingID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to insert listing: %w", err)
+	}
+
+	return listingID, nil
 }

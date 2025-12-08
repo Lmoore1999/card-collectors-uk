@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"golang.org/x/text/unicode/norm"
 	"io"
 	"log"
 	"net/http"
@@ -16,10 +17,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
-var (
-	NumberOfWorkers int = 10
+const (
+	numberOfWorkers = 10
 )
 
 type Retriever struct {
@@ -29,16 +31,17 @@ type Retriever struct {
 	clientSecret      string
 	playersToRetrieve []database.PlayerRow
 	setsToRetrieve    []database.SetRow
+	client            *Client
 }
 
 type job struct {
-	Set    database.SetRow
-	Player database.PlayerRow
+	Set     database.SetRow
+	Players []database.PlayerRow
 }
 
 type listingResult struct {
 	Set      database.SetRow
-	Player   database.PlayerRow
+	Players  []database.PlayerRow
 	Listings []Item
 	Err      error
 }
@@ -46,6 +49,9 @@ type listingResult struct {
 func InitialiseRetriever(ctx context.Context, sets []database.SetRow, players []database.PlayerRow) (Retriever, error) {
 	var retriever Retriever
 	retriever.name = "Ebay"
+	retriever.searchURL = "https://api.ebay.com/buy/browse/v1/item_summary/search"
+	retriever.setsToRetrieve = append(retriever.setsToRetrieve, sets...)
+	retriever.playersToRetrieve = append(retriever.playersToRetrieve, players...)
 
 	apiCredentials, err := database.GetAPICredentialsByMarketplaceName(ctx, retriever.Name())
 	if err != nil {
@@ -57,46 +63,59 @@ func InitialiseRetriever(ctx context.Context, sets []database.SetRow, players []
 		return Retriever{}, fmt.Errorf("failed to decrypt api credentials: %w", err)
 	}
 
-	return Retriever{
-		name:              "Ebay",
-		searchURL:         "https://api.ebay.com/buy/browse/v1/item_summary/search",
-		clientID:          apiCredentials.Username,
-		clientSecret:      decryptedPassword,
-		playersToRetrieve: players,
-		setsToRetrieve:    sets,
-	}, nil
+	retriever.clientID = apiCredentials.Username
+	retriever.clientSecret = decryptedPassword
+
+	accessToken, err := retriever.getEbayAccessToken()
+	if err != nil {
+		return Retriever{}, fmt.Errorf("failed to retrieve access token: %w", err)
+	}
+
+	rateLimits, err := getRateLimits(accessToken, browseAPIName, buyAPIContext)
+	if err != nil {
+		return Retriever{}, fmt.Errorf("failed to retrieve rate limits: %w", err)
+	}
+
+	remaining, resetAt, timeWindow := extractBrowseLimits(rateLimits)
+	retriever.client = &Client{
+		AccessToken: accessToken,
+		Limiter: &rateLimiter{
+			remaining:  remaining,
+			resetAt:    resetAt,
+			timeWindow: timeWindow,
+		},
+	}
+
+	log.Printf("Retriever initialised: {Name: %s, Limiter: {Remaining: %d, ResetAt: %v, TimeWindow: %d}}",
+		retriever.name,
+		retriever.client.Limiter.remaining,
+		retriever.client.Limiter.resetAt,
+		retriever.client.Limiter.timeWindow,
+	)
+
+	retriever.startLimitRefresher(ctx, limitRefreshInterval)
+
+	return retriever, nil
 }
 
 func (r Retriever) Name() string {
 	return r.name
 }
 
-func (r Retriever) GetListings(ctx context.Context) (map[card.CanonicalCard][]analysis.Listing, error) {
-	accessToken, err := r.getEbayAccessToken()
-	if err != nil {
-		return nil, fmt.Errorf("failed to retrieve access token: %w", err)
-	}
-
-	results := make(map[card.CanonicalCard][]analysis.Listing)
-	var mu sync.Mutex
-
-	numberOfWorkers := 1
+func (r Retriever) GetAndStoreListings(ctx context.Context) {
 	jobs := make(chan job)
 	output := make(chan listingResult)
 
-	var workers sync.WaitGroup
+	var wg sync.WaitGroup
 	for i := 0; i < numberOfWorkers; i++ {
-		workers.Add(1)
+		wg.Add(1)
 		go func() {
-			defer workers.Done()
+			defer wg.Done()
 			for j := range jobs {
-				listings, err := r.fetchListings(accessToken, j.Set, j.Player)
-				if err != nil {
-					log.Printf("Failed to fetch listings: %v", err)
-				}
+				listings, err := r.fetchListings(j.Set, j.Players)
 				output <- listingResult{
 					Set:      j.Set,
-					Player:   j.Player,
+					Players:  j.Players,
 					Listings: listings,
 					Err:      err,
 				}
@@ -105,59 +124,69 @@ func (r Retriever) GetListings(ctx context.Context) (map[card.CanonicalCard][]an
 	}
 
 	go func() {
-		for _, set := range r.setsToRetrieve {
-			for _, player := range r.playersToRetrieve {
-				select {
-				case jobs <- job{Set: set, Player: player}:
-				case <-ctx.Done():
-					close(jobs)
-					return
-				}
+		batchedJobs := r.makeJobs()
+		for _, jb := range batchedJobs {
+			select {
+			case jobs <- jb:
+			case <-ctx.Done():
+				close(jobs)
+				return
 			}
 		}
-
 		close(jobs)
 	}()
 
 	go func() {
-		workers.Wait()
+		wg.Wait()
 		close(output)
 	}()
 
 	for res := range output {
 		if res.Err != nil {
-			log.Printf("error fetching %s %s: %v", res.Set.SetName, res.Player.SecondName, res.Err)
+			log.Printf("error fetching results: %v", res.Err)
 			continue
 		}
 
 		for _, item := range res.Listings {
-			canonicalCard, analysisListing, ok := r.processListing(item)
-			if !ok {
-				log.Printf("error processing %s %s: %v", res.Set.SetName, res.Player.SecondName, res.Err)
+			canonicalCard, analysisListing, err := r.processListing(item)
+			if err != nil {
+				log.Printf("error processing %s: %v", item.Title, err)
 				continue
 			}
 
-			mu.Lock()
-			results[canonicalCard] = append(results[canonicalCard], analysisListing)
-			mu.Unlock()
+			listingID, err := database.InsertListingWithCanonicalCard(ctx, canonicalCard.Key(), analysisListing)
+			if err != nil {
+				log.Printf("error inserting listing %s: %v", canonicalCard.Key(), err)
+				continue
+			}
+
+			log.Printf("ListingID %d successfully inserted", listingID)
 		}
 	}
-
-	return results, nil
 }
 
-func (r Retriever) fetchListings(accessToken string, set database.SetRow, player database.PlayerRow) ([]Item, error) {
+func (r Retriever) fetchListings(set database.SetRow, players []database.PlayerRow) ([]Item, error) {
 	var listings []Item
 	offset := 0
 	limit := 200
 
-	query := fmt.Sprintf("%s %s %s %s", set.CompanyName, set.SetName, player.FirstName, player.SecondName)
+	names := make([]string, len(players))
+	for i, p := range players {
+		names[i] = cleanName(fmt.Sprintf("%s %s", p.FirstName, p.SecondName))
+	}
+
+	playersQuery := strings.Join(names, " OR ")
+	query := fmt.Sprintf("%s %s %s", set.CompanyName, set.SetName, playersQuery)
 
 	for {
-		body, err := r.searchEbay(accessToken, query, offset, limit)
+		r.waitBeforeCall()
+
+		body, err := r.searchEbay(r.client.AccessToken, query, offset, limit)
 		if err != nil {
 			return nil, err
 		}
+
+		r.reduceRemainingRequests()
 
 		var response SearchResponse
 		err = json.Unmarshal(body, &response)
@@ -177,26 +206,27 @@ func (r Retriever) fetchListings(accessToken string, set database.SetRow, player
 		}
 	}
 
-	fmt.Printf("%d listings found for query: %s\n", len(listings), query)
+	log.Printf("Query %s: listings count: %d", query, len(listings))
+
 	return listings, nil
 }
 
-func (r Retriever) processListing(item Item) (card.CanonicalCard, analysis.Listing, bool) {
+func (r Retriever) processListing(item Item) (card.CanonicalCard, analysis.Listing, error) {
 	canonicalCard, err := card.NewCanonicalCardFromListing(item.Title, item.ShortDescription, r.setsToRetrieve, r.playersToRetrieve)
 	if err != nil {
-		return card.CanonicalCard{}, analysis.Listing{}, false
+		return card.CanonicalCard{}, analysis.Listing{}, err
 	}
 
 	price, err := strconv.ParseFloat(item.Price.Value, 32)
 	if err != nil {
-		return card.CanonicalCard{}, analysis.Listing{}, false
+		return card.CanonicalCard{}, analysis.Listing{}, fmt.Errorf("failed to parse price: %+v", err)
 	}
 
-	shipping := 0.0
+	shipping := -1.0
 	for _, opt := range item.ShippingOptions {
 		v, err := strconv.ParseFloat(opt.ShippingCost.Value, 32)
 		if err == nil {
-			if shipping == 0 || v < shipping {
+			if shipping == -1.0 || v < shipping {
 				shipping = v
 			}
 		}
@@ -213,7 +243,7 @@ func (r Retriever) processListing(item Item) (card.CanonicalCard, analysis.Listi
 		shipping,
 		item.StartDate,
 		item.EndDate,
-	), true
+	), nil
 }
 
 type SearchResponse struct {
@@ -242,7 +272,7 @@ type ShippingOptions struct {
 }
 
 func (r Retriever) searchEbay(accessToken string, query string, offset int, limit int) ([]byte, error) {
-	endpoint := fmt.Sprintf(fmt.Sprintf("%s?q=%s&limit=%d&offset=%d&filter=deliveryCountry:GB", r.searchURL, url.QueryEscape(query), limit, offset))
+	endpoint := fmt.Sprintf("%s?q=%s&limit=%d&offset=%d&filter=deliveryCountry:GB", r.searchURL, url.QueryEscape(query), limit, offset)
 
 	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -311,4 +341,44 @@ func (r Retriever) getEbayAccessToken() (string, error) {
 	}
 
 	return response.AccessToken, nil
+}
+
+func (r Retriever) makeJobs() []job {
+	var jobs []job
+	var maxBatchSize = 1
+
+	batches := batchPlayers(r.playersToRetrieve, maxBatchSize)
+
+	for _, set := range r.setsToRetrieve {
+		for _, batch := range batches {
+			jobs = append(jobs, job{
+				Set:     set,
+				Players: batch,
+			})
+		}
+	}
+
+	return jobs
+}
+
+func batchPlayers(players []database.PlayerRow, maxBatchSize int) [][]database.PlayerRow {
+	var batches [][]database.PlayerRow
+	for i := 0; i < len(players); i += maxBatchSize {
+		end := i + maxBatchSize
+		if end > len(players) {
+			end = len(players)
+		}
+		batches = append(batches, players[i:end])
+	}
+	return batches
+}
+
+func cleanName(name string) string {
+	t := norm.NFD.String(name)
+	return strings.Map(func(r rune) rune {
+		if unicode.Is(unicode.Mn, r) { // remove accents
+			return -1
+		}
+		return r
+	}, t)
 }

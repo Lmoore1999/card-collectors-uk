@@ -3,6 +3,7 @@ package analysis
 import "time"
 
 type Listing struct {
+	CanonicalCardID      int64
 	MarketplaceListingID string
 	Marketplace          string
 	Title                string
@@ -13,6 +14,7 @@ type Listing struct {
 	ShippingCost         float64
 	ListingDate          time.Time
 	EndDate              time.Time
+	SoldAmount           float64
 }
 
 func NewListing(

@@ -36,8 +36,6 @@ func main() {
 		log.Fatalf("Failed to get all sets: %v", err)
 	}
 
-	fmt.Printf("Players found: %d\nSets found: %d\n", len(players), len(sets))
-
 	initialisedRetrievers, err := retrievers.InitialiseRetrievers(ctx, sets, players)
 	if err != nil {
 		log.Fatalf("Failed to initialise retreivers: %v", err)
@@ -50,12 +48,7 @@ func main() {
 func startNewListingsPoller(ctx context.Context, cfg *config.Config, retrievers []retrievers.Retriever) {
 	// Run immediately
 	for _, retriever := range retrievers {
-		listings, err := retriever.GetListings(ctx)
-		if err != nil {
-			log.Printf("Failed to get listings: %v", err)
-			continue
-		}
-		fmt.Printf("Retrieved %d listings\n", len(listings))
+		retriever.GetAndStoreListings(ctx)
 	}
 
 	// Start ticker for scheduled polling
@@ -69,12 +62,7 @@ func startNewListingsPoller(ctx context.Context, cfg *config.Config, retrievers 
 			return
 		case <-ticker.C:
 			for _, retriever := range retrievers {
-				listings, err := retriever.GetListings(ctx)
-				if err != nil {
-					log.Printf("Failed to get listings: %v", err)
-					continue
-				}
-				fmt.Printf("Retrieved %d listings\n", len(listings))
+				retriever.GetAndStoreListings(ctx)
 			}
 		}
 	}

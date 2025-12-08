@@ -1,8 +1,6 @@
 package retrievers
 
 import (
-	"card-collectors-uk/analysis"
-	"card-collectors-uk/card"
 	"card-collectors-uk/database"
 	"card-collectors-uk/retrievers/ebay"
 	"context"
@@ -11,7 +9,7 @@ import (
 
 type Retriever interface {
 	Name() string
-	GetListings(ctx context.Context) (map[card.CanonicalCard][]analysis.Listing, error)
+	GetAndStoreListings(ctx context.Context)
 }
 
 func InitialiseRetrievers(ctx context.Context, sets []database.SetRow, players []database.PlayerRow) ([]Retriever, error) {
